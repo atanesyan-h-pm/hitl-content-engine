@@ -1,0 +1,45 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local databases & logs
+*.sqlite3
+*.db
+*.log
+
+# Node (if a frontend is added)
+node_modules/
+.next/
+.vite/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local settings
+.claude/settings.local.json
