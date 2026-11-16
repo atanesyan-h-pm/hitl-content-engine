@@ -1,137 +1,168 @@
 /**
- * ELITE B2B SAAS CONTENT PIPELINE (Cloud Run Architecture)
- * Apps Script -> Cloud Run HTTP (main.py) -> Google Docs
+ * HUMAN-IN-THE-LOOP (HITL) B2B CONTENT PUBLISHING ENGINE
+ * Google Sheets -> Apps Script (Code.gs) -> Cloud Run (main.py) -> Google Docs
  */
 
 // ==========================================
-// 1. CONFIGURATION & PROMPT IDs
+// 1. CONFIGURATION & IDs
 // ==========================================
 const CLOUD_RUN_URL = 'https://crewai-blog-webhook-782827619242.europe-west1.run.app';
+const DESTINATION_FOLDER_ID = '16Xf2F8orcvEsSeQK5k40_uXu4d2o25en';
 
 const PROMPT_DOC_IDS = {
   RESEARCHER: '1myPY_C7bTOf-pBh6UZT5OEYfFX1Jgrn2-PpDt1JIk00',
   PLANNER: '1OSwiDLVLPlWi-t8Noz81Ov0IcPWVjFU2n6IJW77hpYo',
-  WRITER: '1LFO94HFl2aJWxK6qBgpXgnCRsbtPlJlqLrLQi21y4yI'
+  WRITER: '1LFO94HFl2aJWxK6qBgpXgnCRsbtPlJlqLrLQi21y4yI',
+  OPTIMIZER: 'REPLACE_WITH_YOUR_AGENT_D_OPTIMIZER_DOC_ID'
 };
 
 // ==========================================
-// 2. SPREADSHEET MENU & TRIGGER FUNCTIONS
+// 2. SPREADSHEET MENU
 // ==========================================
-
-/**
- * Creates custom menu in Google Sheets on document open.
- */
 function onOpen() {
   SpreadsheetApp.getUi()
-    .createMenu('Content Pipeline')
-    .addItem('Run Pipeline for Selected Row', 'runForSelectedRow')
-    .addItem('Run Pipeline for All Pending Rows', 'runForActiveSheet')
+    .createMenu('🚀 AI Content Engine')
+    .addItem('Phase 1: Generate Draft', 'runPhase1Draft')
+    .addItem('Phase 2: SEO/GEO Optimize', 'runPhase2Optimize')
     .addToUi();
 }
 
-/**
- * Runs the content pipeline for the currently selected row in the spreadsheet.
- */
-function runForSelectedRow() {
+// ==========================================
+// 3. PHASE 1: AUTOMATED DRAFTING (v1)
+// ==========================================
+function runPhase1Draft() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   const row = sheet.getActiveCell().getRow();
-  
+
   if (row < 2) {
     SpreadsheetApp.getUi().alert('Please select a data row (row 2 or below).');
     return;
   }
-  
-  const topic = sheet.getRange(row, 1).getValue();
-  const coreFocus = sheet.getRange(row, 2).getValue();
-  const description = sheet.getRange(row, 3).getValue();
-  
+
+  const topic = String(sheet.getRange(row, 1).getValue()).trim();
+  const coreFocus = String(sheet.getRange(row, 2).getValue()).trim();
+  const description = String(sheet.getRange(row, 3).getValue()).trim();
+
   if (!topic) {
     SpreadsheetApp.getUi().alert('Selected row has no Topic in Column A.');
     return;
   }
-  
-  SpreadsheetApp.getActiveSpreadsheet().toast('Processing row ' + row + ': ' + topic, 'Content Pipeline', 5);
-  
-  const result = runContentPipeline(topic, coreFocus, description);
-  sheet.getRange(row, 4).setValue(result.docUrl);
-  
-  SpreadsheetApp.getUi().alert('Pipeline completed successfully!\nOutput Doc: ' + result.docUrl);
+
+  const draftCell = sheet.getRange(row, 4);     // Column D: Output Doc Link
+  const approvalCell = sheet.getRange(row, 5);  // Column E: Human Edits
+
+  draftCell.setValue('⏳ AI is drafting v1...');
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getActiveSpreadsheet().toast('Running Phase 1 (Research -> Plan -> Write) for: ' + topic, 'Phase 1 Started', 8);
+
+  try {
+    const payload = {
+      action: 'draft',
+      topic: topic,
+      core_focus: coreFocus,
+      description: description,
+      research_prompt: getDocText(PROMPT_DOC_IDS.RESEARCHER),
+      plan_prompt: getDocText(PROMPT_DOC_IDS.PLANNER),
+      writer_prompt: getDocText(PROMPT_DOC_IDS.WRITER)
+    };
+
+    const articleText = callCloudRunApi(payload);
+    const docTitle = topic + ' - v1 (Draft)';
+    const docUrl = saveToTargetFolder(docTitle, articleText);
+
+    draftCell.setValue(docUrl);
+    approvalCell.setValue('Pending Review');
+
+    SpreadsheetApp.getUi().alert('Phase 1 Complete!\n\nDraft v1 created: ' + docUrl + '\n\nReview the doc, then set Column E to "Approved" before running Phase 2.');
+  } catch (error) {
+    draftCell.setValue('❌ Error: ' + error.message);
+    SpreadsheetApp.getUi().alert('Phase 1 Failed:\n' + error.message);
+  }
 }
 
-/**
- * Runs the content pipeline for all rows in the sheet that do not yet have an output link.
- */
-function runForActiveSheet() {
+// ==========================================
+// 4. PHASE 2: SEO / GEO OPTIMIZATION (v2)
+// ==========================================
+function runPhase2Optimize() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  const lastRow = sheet.getLastRow();
-  
-  if (lastRow < 2) {
-    SpreadsheetApp.getUi().alert('No data rows found in the active sheet.');
+  const row = sheet.getActiveCell().getRow();
+
+  if (row < 2) {
+    SpreadsheetApp.getUi().alert('Please select a data row (row 2 or below).');
     return;
   }
-  
-  let processedCount = 0;
-  for (let row = 2; row <= lastRow; row++) {
-    const topic = sheet.getRange(row, 1).getValue();
-    const coreFocus = sheet.getRange(row, 2).getValue();
-    const description = sheet.getRange(row, 3).getValue();
-    const existingLink = sheet.getRange(row, 4).getValue();
-    
-    if (topic && !existingLink) {
-      SpreadsheetApp.getActiveSpreadsheet().toast('Processing row ' + row + '/' + lastRow, 'Content Pipeline', 5);
-      const result = runContentPipeline(topic, coreFocus, description);
-      sheet.getRange(row, 4).setValue(result.docUrl);
-      processedCount++;
-    }
-  }
-  
-  SpreadsheetApp.getUi().alert('Batch run complete. Processed ' + processedCount + ' row(s).');
-}
 
-// ==========================================
-// 3. MAIN PIPELINE ORCHESTRATOR
-// ==========================================
-// ⚠️ Transmits Google Doc prompts and sheet data to an external Cloud Run endpoint - verify the recipient URL is trusted.
-function runContentPipeline(topic, coreFocus, contextDescription) {
+  const topic = String(sheet.getRange(row, 1).getValue()).trim();
+  const coreFocus = String(sheet.getRange(row, 2).getValue()).trim();
+  const description = String(sheet.getRange(row, 3).getValue()).trim();
+  const v1DocUrl = String(sheet.getRange(row, 4).getValue()).trim();
+  const approvalStatus = String(sheet.getRange(row, 5).getValue()).trim();
+
+  // Mandatory Human-in-the-Loop Gate
+  if (approvalStatus !== 'Approved') {
+    SpreadsheetApp.getUi().alert(
+      'Approval Gate Blocked!\n\nColumn E (Human Edits) must be set to exactly "Approved" before running Phase 2.\nCurrent value: "' + approvalStatus + '"'
+    );
+    return;
+  }
+
+  if (!v1DocUrl || !v1DocUrl.includes('docs.google.com/document/d/')) {
+    SpreadsheetApp.getUi().alert('Column D does not contain a valid Google Doc URL for the v1 draft.');
+    return;
+  }
+
+  if (PROMPT_DOC_IDS.OPTIMIZER === 'REPLACE_WITH_YOUR_AGENT_D_OPTIMIZER_DOC_ID') {
+    SpreadsheetApp.getUi().alert('Configuration Error: Set PROMPT_DOC_IDS.OPTIMIZER in Code.gs first.');
+    return;
+  }
+
+  const finalDocCell = sheet.getRange(row, 6);   // Column F: Reviewed Doc Link
+  const humanReviewCell = sheet.getRange(row, 7); // Column G: Human Review
+
+  finalDocCell.setValue('⏳ AI is optimizing v2...');
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getActiveSpreadsheet().toast('Running Phase 2 (SEO/GEO Optimization) for: ' + topic, 'Phase 2 Started', 8);
+
   try {
-    Logger.log("Fetching system prompts from Google Docs...");
-    const researchPrompt = getDocText(PROMPT_DOC_IDS.RESEARCHER);
-    const planPrompt = getDocText(PROMPT_DOC_IDS.PLANNER);
-    const writerPrompt = getDocText(PROMPT_DOC_IDS.WRITER);
+    const humanEditedDraft = DocumentApp.openByUrl(v1DocUrl).getBody().getText();
 
-    Logger.log("Calling Cloud Run endpoint...");
-    const articleText = callCloudRunApi(topic, coreFocus, contextDescription, researchPrompt, planPrompt, writerPrompt);
+    if (!humanEditedDraft.trim()) {
+      throw new Error('The v1 Google Doc in Column D is empty.');
+    }
 
-    Logger.log("Pipeline complete. Saving output Google Doc...");
-    const docUrl = saveToSameFolder(topic, articleText);
+    const payload = {
+      action: 'optimize',
+      topic: topic,
+      core_focus: coreFocus,
+      description: description,
+      draft_text: humanEditedDraft,
+      optimizer_prompt: getDocText(PROMPT_DOC_IDS.OPTIMIZER)
+    };
 
-    return { article: articleText, docUrl: docUrl };
+    const optimizedArticle = callCloudRunApi(payload);
+    const docTitle = topic + ' - v2 (Final)';
+    const v2DocUrl = saveToTargetFolder(docTitle, optimizedArticle);
 
+    finalDocCell.setValue(v2DocUrl);
+    humanReviewCell.setValue('Ready for CMS');
+
+    SpreadsheetApp.getUi().alert('Phase 2 Complete!\n\nFinal v2 Doc created: ' + v2DocUrl);
   } catch (error) {
-    Logger.log("PIPELINE FAILED: " + error.message);
-    throw error;
+    finalDocCell.setValue('❌ Error: ' + error.message);
+    SpreadsheetApp.getUi().alert('Phase 2 Failed:\n' + error.message);
   }
 }
 
 // ==========================================
-// 4. CLOUD RUN HTTP API CALL
+// 5. CLOUD RUN HTTP CLIENT
 // ==========================================
-function callCloudRunApi(topic, coreFocus, description, researchPrompt, planPrompt, writerPrompt) {
-  const payload = {
-    "action": "draft",
-    "topic": topic,
-    "core_focus": coreFocus,
-    "description": description,
-    "research_prompt": researchPrompt,
-    "plan_prompt": planPrompt,
-    "writer_prompt": writerPrompt
-  };
-
+function callCloudRunApi(payload) {
   const options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+    timeoutSeconds: 360
   };
 
   const response = UrlFetchApp.fetch(CLOUD_RUN_URL, options);
@@ -142,67 +173,37 @@ function callCloudRunApi(topic, coreFocus, description, researchPrompt, planProm
   try {
     json = JSON.parse(jsonText);
   } catch (e) {
-    throw new Error("Invalid JSON response from Cloud Run (" + responseCode + "): " + jsonText);
+    throw new Error('Invalid JSON from Cloud Run (' + responseCode + '): ' + jsonText.substring(0, 300));
   }
 
-  if (responseCode !== 200 || json.status === "error") {
-    const stage = json.failed_stage ? json.failed_stage : "Execution";
-    const details = json.error_details ? json.error_details : jsonText;
-    throw new Error("Cloud Run Error [" + stage + "]: " + details);
+  if (responseCode !== 200 || json.status === 'error') {
+    const stage = json.failed_stage || 'Execution';
+    const details = json.error_details || json.error || jsonText;
+    throw new Error('Cloud Run Error [' + stage + ']: ' + details);
   }
 
   if (!json.article) {
-    throw new Error("Cloud Run response missing 'article' payload.");
+    throw new Error("Cloud Run response missing 'article' field.");
   }
 
   return json.article;
 }
 
 // ==========================================
-// 5. UTILITY & DRIVE FUNCTIONS
+// 6. GOOGLE DRIVE & DOCS HELPERS
 // ==========================================
-
-/**
- * Extracts text from a Google Doc by ID.
- */
 function getDocText(docId) {
-  const doc = DocumentApp.openById(docId);
-  return doc.getBody().getText();
+  return DocumentApp.openById(docId).getBody().getText();
 }
 
-/**
- * Saves generated article to a new Google Doc created in the SAME folder as the active Spreadsheet.
- */
-function saveToSameFolder(topic, article) {
-  const safeTopic = topic.replace(/[^a-z0-9]/gi, '_').substring(0, 30);
-  const docTitle = 'V2_Draft_' + safeTopic;
+function saveToTargetFolder(docTitle, content) {
   const doc = DocumentApp.create(docTitle);
   const docFile = DriveApp.getFileById(doc.getId());
+  const targetFolder = DriveApp.getFolderById(DESTINATION_FOLDER_ID);
 
-  const ssId = SpreadsheetApp.getActiveSpreadsheet().getId();
-  const ssFile = DriveApp.getFileById(ssId);
-  const parents = ssFile.getParents();
+  docFile.moveTo(targetFolder);
+  doc.getBody().setText(content);
+  doc.saveAndClose();
 
-  if (parents.hasNext()) {
-    const targetFolder = parents.next();
-    docFile.moveTo(targetFolder);
-  }
-
-  const body = doc.getBody();
-  body.appendParagraph("--- FINAL ARTICLE ---").setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  body.appendParagraph(article);
-
-  Logger.log("Saved output document: " + doc.getUrl());
   return doc.getUrl();
-}
-
-/**
- * Test execution function.
- */
-function testV2Pipeline() {
-  const testTopic = "Context is King: Scale, Startups & Deep Tech";
-  const testCoreFocus = "Explores how the PM role mutates based on the environment.";
-  const testContext = "Target audience is experienced PMs. Keep tone analytical and contrarian.";
-  
-  runContentPipeline(testTopic, testCoreFocus, testContext);
 }

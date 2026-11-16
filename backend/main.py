@@ -7,61 +7,73 @@ from google.genai import types
 PRO_MODEL = "gemini-3.1-pro-preview"
 FLASH_MODEL = "gemini-3.8-flash"
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "3600",
+}
+
+
+def json_response(payload: dict, status_code: int = 200):
+    return (
+        json.dumps(payload),
+        status_code,
+        {"Access-Control-Allow-Origin": "*", "Content-Type": "application/json"},
+    )
+
+
+def strip_scratchpad(text: str) -> str:
+    if "</scratchpad>" in text:
+        return text.split("</scratchpad>")[-1].strip()
+    return text.strip()
+
+
 @functions_framework.http
 def generate_blog_post(request):
-    # 1. Handle CORS preflight
-    if request.method == 'OPTIONS':
-        return ('', 204, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type',
-            'Access-Control-Max-Age': '3600'
-        })
+    if request.method == "OPTIONS":
+        return ("", 204, CORS_HEADERS)
 
-    headers = {'Access-Control-Allow-Origin': '*'}
     current_stage = "Initialization"
 
     try:
-        # 2. Parse payload from Google Apps Script
         request_json = request.get_json(silent=True) or {}
 
-        action = request_json.get('action', 'draft')
-        topic = request_json.get('topic', 'B2B Content')
-        core_focus = request_json.get('core_focus', '')
-        description = request_json.get('description', '')
-        draft_text = request_json.get('draft_text', '')
+        action = request_json.get("action", "draft")
+        topic = request_json.get("topic", "B2B Content")
+        core_focus = request_json.get("core_focus", "")
+        description = request_json.get("description", "")
+        draft_text = request_json.get("draft_text", "")
 
-        # Construct the base XML inputs required by V2 prompts
-        xml_base_inputs = f"""
-<topic>{topic}</topic>
-<core_focus>{core_focus}</core_focus>
-<description>{description}</description>
-"""
+        xml_base_inputs = (
+            f"<topic>{topic}</topic>\n"
+            f"<core_focus>{core_focus}</core_focus>\n"
+            f"<description>{description}</description>"
+        )
 
-        # 3. Retrieve API key & initialize client
         api_key = os.environ.get("GOOGLE_API_KEY_ARTICLE") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
-            return (
-                json.dumps({"error": "Missing GOOGLE_API_KEY_ARTICLE environment variable"}),
+            return json_response(
+                {
+                    "status": "error",
+                    "failed_stage": current_stage,
+                    "error_details": "Missing GOOGLE_API_KEY_ARTICLE environment variable.",
+                },
                 500,
-                {**headers, "Content-Type": "application/json"}
             )
 
         client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(api_version="v1beta")
+            http_options=types.HttpOptions(api_version="v1beta"),
         )
 
         # ======================================================================
-        # PHASE 1: AUTOMATED DRAFTING
+        # PHASE 1: AUTOMATED DRAFTING (Researcher -> Planner -> Writer)
         # ======================================================================
-        if action == 'draft':
-
-            # --- STAGE 1: Intelligence Researcher (Pro + Google Search) ---
+        if action == "draft":
+            # Stage 1: Intelligence Researcher (Pro + Google Search)
             current_stage = f"Stage 1: Researcher ({PRO_MODEL})"
-            research_prompt = request_json.get('research_prompt', 'You are a researcher.')
-            
-            # Append strict XML inputs
+            research_prompt = request_json.get("research_prompt", "You are a researcher.")
             full_research_prompt = f"{research_prompt}\n\n--- ASSIGNMENT INPUTS ---\n{xml_base_inputs}"
 
             research_res = client.models.generate_content(
@@ -69,23 +81,23 @@ def generate_blog_post(request):
                 contents=full_research_prompt,
                 config=types.GenerateContentConfig(
                     tools=[{"google_search": {}}],
-                    temperature=0.7, # Lowered slightly for factual research rigidity
+                    temperature=0.7,
                     max_output_tokens=65536,
                     thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
-                )
+                ),
             )
-            research_dossier = research_res.text
+            research_dossier = research_res.text or ""
 
-            # HALT PIPELINE IF RESEARCHER THROWS INPUT ERROR
             if "INPUT ERROR:" in research_dossier:
                 raise ValueError(f"Researcher Aborted: {research_dossier.strip()}")
 
-            # --- STAGE 2: Editorial Architect / Planner (Flash) ---
+            # Stage 2: Editorial Architect / Planner (Flash)
             current_stage = f"Stage 2: Planner ({FLASH_MODEL})"
-            plan_prompt = request_json.get('plan_prompt', 'You are an Editorial Architect.')
-            
-            # Append strict XML inputs including the new dossier
-            full_plan_prompt = f"{plan_prompt}\n\n--- ASSIGNMENT INPUTS ---\n{xml_base_inputs}\n<research_dossier>\n{research_dossier}\n</research_dossier>"
+            plan_prompt = request_json.get("plan_prompt", "You are an Editorial Architect.")
+            full_plan_prompt = (
+                f"{plan_prompt}\n\n--- ASSIGNMENT INPUTS ---\n{xml_base_inputs}\n"
+                f"<research_dossier>\n{research_dossier}\n</research_dossier>"
+            )
 
             plan_res = client.models.generate_content(
                 model=FLASH_MODEL,
@@ -93,57 +105,61 @@ def generate_blog_post(request):
                 config=types.GenerateContentConfig(
                     max_output_tokens=65536,
                     thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
-                )
+                ),
             )
-            editorial_blueprint = plan_res.text
+            editorial_blueprint = plan_res.text or ""
 
-            # HALT PIPELINE IF PLANNER THROWS INPUT ERROR
             if "INPUT ERROR:" in editorial_blueprint:
                 raise ValueError(f"Planner Aborted: {editorial_blueprint.strip()}")
 
-            # --- STAGE 3: Master Creative Writer (Pro) ---
+            # Stage 3: Senior B2B Writer (Pro)
             current_stage = f"Stage 3: Writer ({PRO_MODEL})"
-            writer_prompt = request_json.get('writer_prompt', 'You are a B2B writer.')
-            
-            # Append strict XML inputs including dossier and blueprint
-            full_writer_prompt = f"{writer_prompt}\n\n--- ASSIGNMENT INPUTS ---\n{xml_base_inputs}\n<research_dossier>\n{research_dossier}\n</research_dossier>\n<editorial_blueprint>\n{editorial_blueprint}\n</editorial_blueprint>"
+            writer_prompt = request_json.get("writer_prompt", "You are a B2B writer.")
+            full_writer_prompt = (
+                f"{writer_prompt}\n\n--- ASSIGNMENT INPUTS ---\n{xml_base_inputs}\n"
+                f"<research_dossier>\n{research_dossier}\n</research_dossier>\n"
+                f"<editorial_blueprint>\n{editorial_blueprint}\n</editorial_blueprint>"
+            )
 
             writer_res = client.models.generate_content(
                 model=PRO_MODEL,
                 contents=full_writer_prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.7, # Lowered slightly to respect blueprint constraints
+                    temperature=0.7,
                     max_output_tokens=65536,
                     thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
-                )
+                ),
             )
-            raw_writer_output = writer_res.text
-            
-            # HALT PIPELINE IF WRITER THROWS INPUT ERROR
+            raw_writer_output = writer_res.text or ""
+
             if "INPUT ERROR:" in raw_writer_output:
                 raise ValueError(f"Writer Aborted: {raw_writer_output.strip()}")
 
-            # STRIP THE SCRATCHPAD (V2 Rule: Writer outputs internal reasoning in <scratchpad>)
-            if "</scratchpad>" in raw_writer_output:
-                final_output = raw_writer_output.split("</scratchpad>")[-1].strip()
-            else:
-                final_output = raw_writer_output.strip()
+            final_output = strip_scratchpad(raw_writer_output)
 
         # ======================================================================
-        # PHASE 2: SEO / GEO OPTIMIZATION
+        # PHASE 2: SEO / GEO OPTIMIZATION (Optimizer)
         # ======================================================================
-        elif action == 'optimize':
+        elif action == "optimize":
+            current_stage = f"Stage 4: Optimizer ({FLASH_MODEL})"
+
             if not draft_text.strip():
-                return (
-                    json.dumps({"error": "No draft text provided for optimization."}),
+                return json_response(
+                    {
+                        "status": "error",
+                        "failed_stage": current_stage,
+                        "error_details": "No draft_text provided for optimization.",
+                    },
                     400,
-                    {**headers, "Content-Type": "application/json"}
                 )
 
-            current_stage = f"Stage 4: Optimizer ({FLASH_MODEL})"
-            optimize_prompt = request_json.get('optimizer_prompt', 'You are an SEO specialist. Optimize this text.')
-            
-            full_optimize_prompt = f"{optimize_prompt}\n\n--- HUMAN-EDITED DRAFT TO OPTIMIZE ---\n<draft_text>\n{draft_text}\n</draft_text>"
+            optimize_prompt = request_json.get(
+                "optimizer_prompt", "You are an SEO/GEO specialist. Optimize this text."
+            )
+            full_optimize_prompt = (
+                f"{optimize_prompt}\n\n--- ASSIGNMENT INPUTS ---\n{xml_base_inputs}\n"
+                f"<draft_text>\n{draft_text}\n</draft_text>"
+            )
 
             optimize_res = client.models.generate_content(
                 model=FLASH_MODEL,
@@ -151,36 +167,41 @@ def generate_blog_post(request):
                 config=types.GenerateContentConfig(
                     max_output_tokens=65536,
                     thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
-                )
+                ),
             )
-            final_output = optimize_res.text.strip()
+            raw_optimize_output = optimize_res.text or ""
+
+            if "INPUT ERROR:" in raw_optimize_output:
+                raise ValueError(f"Optimizer Aborted: {raw_optimize_output.strip()}")
+
+            final_output = strip_scratchpad(raw_optimize_output)
 
         else:
-            return (
-                json.dumps({"error": "Invalid action parameter"}),
+            return json_response(
+                {
+                    "status": "error",
+                    "failed_stage": current_stage,
+                    "error_details": f"Invalid action parameter: '{action}'. Expected 'draft' or 'optimize'.",
+                },
                 400,
-                {**headers, "Content-Type": "application/json"}
             )
 
-        # 4. Return response matching the Google Apps Script expected schema
-        return (
-            json.dumps({
+        return json_response(
+            {
                 "status": "success",
                 "action_completed": action,
                 "topic": topic,
-                "article": final_output
-            }),
+                "article": final_output,
+            },
             200,
-            {**headers, "Content-Type": "application/json"}
         )
 
     except Exception as e:
-        return (
-            json.dumps({
+        return json_response(
+            {
                 "status": "error",
                 "failed_stage": current_stage,
-                "error_details": str(e)
-            }),
+                "error_details": str(e),
+            },
             500,
-            {**headers, "Content-Type": "application/json"}
         )
