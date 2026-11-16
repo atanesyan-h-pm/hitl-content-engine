@@ -1,12 +1,12 @@
 /**
- * ELITE B2B SAAS CONTENT PIPELINE (V2)
- * Agent A (Researcher) -> Agent B (Planner) -> Agent C (Writer)
+ * ELITE B2B SAAS CONTENT PIPELINE (Cloud Run Architecture)
+ * Apps Script -> Cloud Run HTTP (main.py) -> Google Docs
  */
 
 // ==========================================
-// 1. CONFIGURATION & PROMPT IDs (V2)
+// 1. CONFIGURATION & PROMPT IDs
 // ==========================================
-const API_KEY = 'YOUR_GEMINI_OR_OPENAI_API_KEY'; // Replace with your actual API key
+const CLOUD_RUN_URL = 'https://crewai-blog-webhook-782827619242.europe-west1.run.app';
 
 const PROMPT_DOC_IDS = {
   RESEARCHER: '1myPY_C7bTOf-pBh6UZT5OEYfFX1Jgrn2-PpDt1JIk00',
@@ -15,78 +15,97 @@ const PROMPT_DOC_IDS = {
 };
 
 // ==========================================
-// 2. MAIN PIPELINE ORCHESTRATOR
+// 2. SPREADSHEET MENU & TRIGGER FUNCTIONS
 // ==========================================
+
+/**
+ * Creates custom menu in Google Sheets on document open.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Content Pipeline')
+    .addItem('Run Pipeline for Selected Row', 'runForSelectedRow')
+    .addItem('Run Pipeline for All Pending Rows', 'runForActiveSheet')
+    .addToUi();
+}
+
+/**
+ * Runs the content pipeline for the currently selected row in the spreadsheet.
+ */
+function runForSelectedRow() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const row = sheet.getActiveCell().getRow();
+  
+  if (row < 2) {
+    SpreadsheetApp.getUi().alert('Please select a data row (row 2 or below).');
+    return;
+  }
+  
+  const topic = sheet.getRange(row, 1).getValue();
+  const coreFocus = sheet.getRange(row, 2).getValue();
+  const description = sheet.getRange(row, 3).getValue();
+  
+  if (!topic) {
+    SpreadsheetApp.getUi().alert('Selected row has no Topic in Column A.');
+    return;
+  }
+  
+  SpreadsheetApp.getActiveSpreadsheet().toast('Processing row ' + row + ': ' + topic, 'Content Pipeline', 5);
+  
+  const result = runContentPipeline(topic, coreFocus, description);
+  sheet.getRange(row, 4).setValue(result.docUrl);
+  
+  SpreadsheetApp.getUi().alert('Pipeline completed successfully!\nOutput Doc: ' + result.docUrl);
+}
+
+/**
+ * Runs the content pipeline for all rows in the sheet that do not yet have an output link.
+ */
+function runForActiveSheet() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert('No data rows found in the active sheet.');
+    return;
+  }
+  
+  let processedCount = 0;
+  for (let row = 2; row <= lastRow; row++) {
+    const topic = sheet.getRange(row, 1).getValue();
+    const coreFocus = sheet.getRange(row, 2).getValue();
+    const description = sheet.getRange(row, 3).getValue();
+    const existingLink = sheet.getRange(row, 4).getValue();
+    
+    if (topic && !existingLink) {
+      SpreadsheetApp.getActiveSpreadsheet().toast('Processing row ' + row + '/' + lastRow, 'Content Pipeline', 5);
+      const result = runContentPipeline(topic, coreFocus, description);
+      sheet.getRange(row, 4).setValue(result.docUrl);
+      processedCount++;
+    }
+  }
+  
+  SpreadsheetApp.getUi().alert('Batch run complete. Processed ' + processedCount + ' row(s).');
+}
+
+// ==========================================
+// 3. MAIN PIPELINE ORCHESTRATOR
+// ==========================================
+// ⚠️ Transmits Google Doc prompts and sheet data to an external Cloud Run endpoint - verify the recipient URL is trusted.
 function runContentPipeline(topic, coreFocus, contextDescription) {
   try {
-    Logger.log("Starting V2 Pipeline...");
+    Logger.log("Fetching system prompts from Google Docs...");
+    const researchPrompt = getDocText(PROMPT_DOC_IDS.RESEARCHER);
+    const planPrompt = getDocText(PROMPT_DOC_IDS.PLANNER);
+    const writerPrompt = getDocText(PROMPT_DOC_IDS.WRITER);
 
-    // Step 0: Load System Prompts from Google Docs
-    const researcherSystemPrompt = getDocText(PROMPT_DOC_IDS.RESEARCHER);
-    const plannerSystemPrompt = getDocText(PROMPT_DOC_IDS.PLANNER);
-    const writerSystemPrompt = getDocText(PROMPT_DOC_IDS.WRITER);
+    Logger.log("Calling Cloud Run endpoint...");
+    const articleText = callCloudRunApi(topic, coreFocus, contextDescription, researchPrompt, planPrompt, writerPrompt);
 
-    // ---------------------------------------------------------
-    // AGENT A: RESEARCHER
-    // ---------------------------------------------------------
-    Logger.log("Running Agent A: Researcher...");
-    const researcherInput = `
-<topic>${topic}</topic>
-<core_focus>${coreFocus}</core_focus>
-<description>${contextDescription}</description>
-    `.trim();
-    
-    const researchDossier = callAI(researcherSystemPrompt, researcherInput);
-    checkForInputError(researchDossier, "Researcher (Agent A)");
+    Logger.log("Pipeline complete. Saving output Google Doc...");
+    const docUrl = saveToSameFolder(topic, articleText);
 
-    // ---------------------------------------------------------
-    // AGENT B: PLANNER
-    // ---------------------------------------------------------
-    Logger.log("Running Agent B: Planner...");
-    const plannerInput = `
-<topic>${topic}</topic>
-<core_focus>${coreFocus}</core_focus>
-<description>${contextDescription}</description>
-
-<research_dossier>
-${researchDossier}
-</research_dossier>
-    `.trim();
-
-    const editorialBlueprint = callAI(plannerSystemPrompt, plannerInput);
-    checkForInputError(editorialBlueprint, "Planner (Agent B)");
-
-    // ---------------------------------------------------------
-    // AGENT C: WRITER
-    // ---------------------------------------------------------
-    Logger.log("Running Agent C: Writer...");
-    const writerInput = `
-<topic>${topic}</topic>
-<core_focus>${coreFocus}</core_focus>
-<description>${contextDescription}</description>
-
-<research_dossier>
-${researchDossier}
-</research_dossier>
-
-<editorial_blueprint>
-${editorialBlueprint}
-</editorial_blueprint>
-    `.trim();
-
-    let rawWriterOutput = callAI(writerSystemPrompt, writerInput);
-    checkForInputError(rawWriterOutput, "Writer (Agent C)");
-
-    // Clean the Writer's output (Strip the <scratchpad>)
-    const finalArticle = extractFinalArticle(rawWriterOutput);
-
-    // ---------------------------------------------------------
-    // FINISH: Output the result
-    // ---------------------------------------------------------
-    Logger.log("Pipeline Complete! Saving to Document...");
-    saveToNewDocument(topic, finalArticle, researchDossier, editorialBlueprint);
-    
-    return finalArticle;
+    return { article: articleText, docUrl: docUrl };
 
   } catch (error) {
     Logger.log("PIPELINE FAILED: " + error.message);
@@ -95,30 +114,53 @@ ${editorialBlueprint}
 }
 
 // ==========================================
-// 3. UTILITY & PARSING FUNCTIONS
+// 4. CLOUD RUN HTTP API CALL
 // ==========================================
+function callCloudRunApi(topic, coreFocus, description, researchPrompt, planPrompt, writerPrompt) {
+  const payload = {
+    "action": "draft",
+    "topic": topic,
+    "core_focus": coreFocus,
+    "description": description,
+    "research_prompt": researchPrompt,
+    "plan_prompt": planPrompt,
+    "writer_prompt": writerPrompt
+  };
 
-/**
- * Checks if the agent aborted due to missing/bad inputs.
- */
-function checkForInputError(output, agentName) {
-  if (output.trim().startsWith("INPUT ERROR:")) {
-    throw new Error(`Pipeline halted by ${agentName}. Reason: ${output.trim()}`);
+  const options = {
+    "method": "post",
+    "contentType": "application/json",
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true
+  };
+
+  const response = UrlFetchApp.fetch(CLOUD_RUN_URL, options);
+  const responseCode = response.getResponseCode();
+  const jsonText = response.getContentText();
+
+  let json;
+  try {
+    json = JSON.parse(jsonText);
+  } catch (e) {
+    throw new Error("Invalid JSON response from Cloud Run (" + responseCode + "): " + jsonText);
   }
+
+  if (responseCode !== 200 || json.status === "error") {
+    const stage = json.failed_stage ? json.failed_stage : "Execution";
+    const details = json.error_details ? json.error_details : jsonText;
+    throw new Error("Cloud Run Error [" + stage + "]: " + details);
+  }
+
+  if (!json.article) {
+    throw new Error("Cloud Run response missing 'article' payload.");
+  }
+
+  return json.article;
 }
 
-/**
- * Removes the <scratchpad> reasoning from the Writer's output to deliver the clean article.
- */
-function extractFinalArticle(writerOutput) {
-  const scratchpadEndTag = "</scratchpad>";
-  if (writerOutput.includes(scratchpadEndTag)) {
-    // Splits at the end tag and returns everything after it, trimmed of whitespace
-    return writerOutput.split(scratchpadEndTag)[1].trim();
-  }
-  // Fallback if the AI didn't use the scratchpad tag
-  return writerOutput.trim();
-}
+// ==========================================
+// 5. UTILITY & DRIVE FUNCTIONS
+// ==========================================
 
 /**
  * Extracts text from a Google Doc by ID.
@@ -129,81 +171,37 @@ function getDocText(docId) {
 }
 
 /**
- * Saves the final output (and optionally the intermediate steps) to a new Google Doc.
+ * Saves generated article to a new Google Doc created in the SAME folder as the active Spreadsheet.
  */
-function saveToNewDocument(topic, article, dossier, blueprint) {
+function saveToSameFolder(topic, article) {
   const safeTopic = topic.replace(/[^a-z0-9]/gi, '_').substring(0, 30);
-  const doc = DocumentApp.create(`V2_Draft_${safeTopic}`);
+  const docTitle = 'V2_Draft_' + safeTopic;
+  const doc = DocumentApp.create(docTitle);
+  const docFile = DriveApp.getFileById(doc.getId());
+
+  const ssId = SpreadsheetApp.getActiveSpreadsheet().getId();
+  const ssFile = DriveApp.getFileById(ssId);
+  const parents = ssFile.getParents();
+
+  if (parents.hasNext()) {
+    const targetFolder = parents.next();
+    docFile.moveTo(targetFolder);
+  }
+
   const body = doc.getBody();
-  
   body.appendParagraph("--- FINAL ARTICLE ---").setHeading(DocumentApp.ParagraphHeading.HEADING1);
   body.appendParagraph(article);
-  
-  // Optional: Append Dossier and Blueprint at the bottom for review
-  body.appendPageBreak();
-  body.appendParagraph("--- EDITORIAL BLUEPRINT (AGENT B) ---").setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  body.appendParagraph(blueprint);
-  
-  body.appendPageBreak();
-  body.appendParagraph("--- RESEARCH DOSSIER (AGENT A) ---").setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  body.appendParagraph(dossier);
-  
-  Logger.log("Saved new document: " + doc.getUrl());
+
+  Logger.log("Saved output document: " + doc.getUrl());
   return doc.getUrl();
 }
 
-// ==========================================
-// 4. API CALL FUNCTION (Adjust for Gemini/OpenAI)
-// ==========================================
-
 /**
- * Standard API call wrapper. 
- * Below is a template for the Gemini API. If you use OpenAI (ChatGPT), 
- * update the endpoint and payload structure accordingly.
+ * Test execution function.
  */
-function callAI(systemInstruction, userPrompt) {
-  // Example using Gemini 1.5 Pro
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${API_KEY}`;
-  
-  const payload = {
-    "system_instruction": {
-      "parts": [{ "text": systemInstruction }]
-    },
-    "contents": [
-      {
-        "role": "user",
-        "parts": [{ "text": userPrompt }]
-      }
-    ],
-    "generationConfig": {
-      "temperature": 0.4 // Keeps output analytical and strictly aligned to instructions
-    }
-  };
-  
-  const options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
-  };
-  
-  const response = UrlFetchApp.fetch(url, options);
-  const json = JSON.parse(response.getContentText());
-  
-  if (json.error) {
-    throw new Error("API Error: " + json.error.message);
-  }
-  
-  // Extract the text from Gemini response
-  return json.candidates[0].content.parts[0].text;
-}
-
-// ==========================================
-// 5. TRIGGER FUNCTION (To run from Editor)
-// ==========================================
 function testV2Pipeline() {
   const testTopic = "Context is King: Scale, Startups & Deep Tech";
-  const testCoreFocus = "Explores how the PM role mutates based on the environment. Contrasts the 0-to-1 PM in a startup with the in-scale enterprise PM, and dives into unique constraints of niche sectors.";
+  const testCoreFocus = "Explores how the PM role mutates based on the environment.";
   const testContext = "Target audience is experienced PMs. Keep tone analytical and contrarian.";
   
   runContentPipeline(testTopic, testCoreFocus, testContext);
