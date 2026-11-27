@@ -1,76 +1,179 @@
 # Human-in-the-Loop (HITL) B2B Content Publishing Engine
 
-An automated, serverless content generation and publishing pipeline that bridges Google Sheets, Google Docs, and Google Cloud Run. This system uses multi-stage AI reasoning (Google Gemini) to draft, refine, and optimize long-form B2B content while ensuring human editors maintain complete narrative control.
+An automated, serverless B2B content generation and publishing pipeline bridging **Google Sheets**, **Google Docs**, and **Google Cloud Run**. The engine uses multi-stage Gemini reasoning (`google-genai`) to research, architect, draft, and optimize technical long-form articles while enforcing a strict **Human-in-the-Loop (HITL)** editorial gate between drafting and final SEO/GEO optimization.
 
-> **Personal Note:** I originally built this engine for myself to support my own blog and scale my content operations. It was designed to solve the exact bottlenecks I faced when trying to publish high-quality, technical product management content—allowing me to scale output without turning my blog into an automated AI "feature factory." 
+> **Personal Note:** I originally built this engine to support my own blog and scale technical Product Management writing without turning my content workflow into an unverified AI "feature factory."
 
-## 1. The Business Problem (Why This Exists)
+---
 
-In modern B2B SaaS organizations, scaling content production usually creates a false binary:
-*   **The Velocity Trap:** Teams use AI to autonomously generate and publish high volumes of content, resulting in generic "digital waste" that fails to rank or resonate with technical audiences.
-*   **The Resource Bottleneck:** Highly skilled product marketers and content strategists spend days manually researching, drafting, and formatting a single article, making it impossible to scale organic reach.
+## 1. Why This Architecture Exists
 
-**The Solution:**
-This architecture solves this by separating the content workflow into two distinct phases with a mandatory "Human Approval Gate" in the middle. The AI does the heavy lifting of research, outlining, and initial drafting (Phase 1). A human expert then injects proprietary anecdotes and refines the tone. Finally, the AI handles the tedious technical polish of SEO formatting and metadata generation (Phase 2). **The AI never optimizes unverified content.**
+Scaling technical B2B content typically forces an undesirable trade-off:
+* **The Velocity Trap:** Autonomous AI pipelines publish unverified prose filled with clichés and hallucinated claims.
+* **The Editorial Bottleneck:** Senior PMs and subject-matter experts spend days researching, outlining, and formatting every piece from scratch.
 
-## 2. Product Architecture & Stack
+**The Solution:** Separate content production into two gated phases:
+1. **Phase 1 (Automated Drafting — `v1`):** Three specialized AI stages (`research` -> `plan` -> `write`) execute sequentially with intermediate Drive checkpointing to produce a cited, blueprint-driven `v1` Google Doc.
+2. **Mandatory Human Gate:** A human editor refines the narrative, injects proprietary examples, resolves all Google Docs margin comments, and marks the row `Approved`.
+3. **Phase 2 (SEO/GEO Optimization — `v2`):** Only after verifying `Approved` status **and** `0` unresolved Google Docs comments does Agent D optimize structure for search/answer engines, append a separated `## SEO & GEO Metadata` package, and mark the row `Ready for CMS`.
 
-The system is a stateless, serverless architecture triggered entirely from a familiar Google Workspace frontend.
+---
 
-### The Technology Stack
-*   **Frontend (UI):** Google Sheets (Master Content Tracker)
-*   **Middleware Router:** Google Apps Script (`Code.gs`)
-*   **Backend Compute:** Google Cloud Run (Python 3.11, serverless containers)
-*   **AI Engine:** `google-genai` SDK
-    *   *Complex Reasoning Tasks (Drafting):* Gemini 3.1 Pro
-    *   *Structural Tasks (Outlining & SEO):* Gemini 3.8 Flash
-*   **Storage:** Google Drive (for v1 Drafts and v2 Final documents)
+## 2. Architecture & Security Model
 
-### The Agent Hierarchy
-The Cloud Run backend utilizes four distinct AI personas in a sequential chain:
-1.  **The Intelligence Researcher (Pro):** Challenges industry assumptions and gathers contrarian angles based on the core topic.
-2.  **The Editorial Architect (Flash):** Structures the researcher's findings into a high-retention, inverted-pyramid outline.
-3.  **The Senior B2B Writer (Pro):** Drafts the full narrative, explicitly avoiding AI clichés and standard B2B jargon.
-4.  **The SEO/GEO Specialist (Flash):** Polishes the human-approved text, adds answer-first summaries for Generative Engine Optimization, and prepends Title/Meta tags.
+```mermaid
+flowchart TD
+    Editor["Human Editor (Google Sheets)"] --> Sheet["Master Tracker Tab + Experiment_Config\nCols A-G Workflow | Cols H-L Non-Destructive Telemetry"]
+    Sheet -->|"Menu Trigger (Tab Guard + DocumentLock)"| GAS["Apps Script (Code.gs + appsscript.json)\nSecrets in PropertiesService | Drive v3 Advanced Service"]
 
-## 3. The End-to-End Workflow
+    GAS -->|"POST /stage (X-Webhook-Secret)\nPhase 1: research -> plan -> write (with Drive Checkpoints)"| CR["Cloud Run (Python 3.11, Gunicorn, Non-Root)\nDedicated Least-Privilege Runtime SA\nSecrets Mounted from GCP Secret Manager"]
+    GAS -->|"Phase 2: Verify Approved + 0 Unresolved Comments\nPOST /stage (action: optimize)"| CR
 
-The entire pipeline is operated by non-technical content leads through a custom `🚀 AI Content Engine` menu inside Google Sheets.
+    CR -->|"Verify Parent == ALLOWED_PROMPT_FOLDER_ID\nExport text/plain + Strip U+E000-U+F8FF"| Prompts["Google Drive Prompt Folder\nShared with Runtime SA as Viewer"]
+    CR -->|"system_instruction + Escaped <inputs> XML\n429/503 Backoff + finish_reason==STOP Guard"| Gemini["Gemini API (v1beta)\ngemini-3.1-pro-preview + gemini-3.8-flash"]
+    CR -->|"200 JSON {output, metrics}"| GAS
 
-### Phase 1: Automated Drafting
-1.  **Input:** The Content Lead fills out a new row in the Master Content Tracker with a `Topic`, `Core Focus`, and `Description`.
-2.  **Trigger:** They click **🚀 AI Content Engine > Phase 1: Generate Draft**.
-3.  **Execution:** Apps Script sends the inputs to Cloud Run. Agents 1, 2, and 3 run sequentially.
-4.  **Output:** A new Google Doc named `[Topic] - v1 (Draft)` is generated and saved to a dedicated Google Drive folder. The document URL is written back to Column D in the spreadsheet, and the status is set to `Pending Review`.
+    GAS -->|"Markdown-to-HTML via Drive.Files.create"| DriveOut["Target Experiment Folder\nFormatted Native Google Docs (v1 / v2)"]
+```
 
-### The Human-in-the-Loop Checkpoint
-This is the critical quality control gate.
-1.  The human editor opens the `v1 (Draft)` Google Doc.
-2.  They review the prose, inject company-specific data, adjust the tone, and verify claims.
-3.  Once satisfied, they return to the Google Sheet and change Column E (`Human Edits`) to **Approved**. *(Phase 2 will be blocked if this cell does not say exactly "Approved".)*
+### Key Security & Reliability Controls
+* **Authenticated Webhook (`X-Webhook-Secret`):** Cloud Run validates `X-Webhook-Secret` in constant time via `hmac.compare_digest` (`401` on mismatch), exposes `GET /health` (`200`), rejects all other non-`POST` methods (`405`), and omits wildcard CORS headers.
+* **Server-Side Prompt Trust Boundary:** Callers never send raw system prompts. Apps Script sends a `prompt_doc_id` from `Experiment_Config`; Cloud Run verifies via Drive API v3 that the file resides inside `ALLOWED_PROMPT_FOLDER_ID`, exports `text/plain`, and strips Google Docs private-use control characters (`U+E000–U+F8FF`).
+* **Prompt-Injection & Output Hardening:** System prompts are isolated in `GenerateContentConfig(system_instruction=...)`, untrusted inputs are XML-escaped inside `<inputs>...</inputs>`, `finish_reason == STOP` and non-empty output are enforced on every stage, and `strip_scratchpad()` uses an anchored regex that rejects unclosed `<scratchpad>` tags.
+* **Split-Stage Execution & Checkpointing:** Phase 1 runs as three bounded HTTP requests (`research`, `plan`, `write`) with exponential backoff on transient `429`/`503` errors and per-stage JSON checkpoints in Drive—allowing Stage 3 retries without re-paying for Stages 1–2.
+* **Non-Destructive Sheet Telemetry & Formatting:** Transient progress, experiment IDs, checkpoints, token/latency metrics, and errors are logged in Columns H–L (archiving replaced URLs in cell Notes), and Markdown is converted to HTML and imported via `Drive.Files.create` directly into the target folder.
 
-### Phase 2: SEO & GEO Optimization
-1.  **Trigger:** The Content Lead clicks **🚀 AI Content Engine > Phase 2: SEO/GEO Optimize**.
-2.  **Execution:** Apps Script verifies the approval status, extracts the raw text directly from the human-edited `v1` Google Doc, and sends it to Cloud Run.
-3.  **Optimization:** Agent 4 (The SEO Specialist) structures the document for search engines and appends metadata.
-4.  **Output:** A brand new Google Doc named `[Topic] - v2 (Final)` is generated and saved to Drive. The URL is written to Column F, ready for final CMS publishing.
+---
 
-## 4. Setup & Deployment Guide
+## 3. Repository Structure
 
-To replicate this system, you must configure the three core environments:
+```text
+.
+├── .env.example                 # Local environment variable template (no real secrets)
+├── cloudbuild.yaml              # CI/CD pipeline: runs pytest gate before Docker build & Cloud Run deploy
+├── apps_script/
+│   ├── Code.gs                  # Sheet menu, split-stage orchestrator, checkpointing, MD->HTML Drive importer
+│   └── appsscript.json          # Apps Script manifest enabling Drive v3 Advanced Service & OAuth scopes
+├── backend/
+│   ├── .dockerignore            # Excludes tests, caches, and local env files from container image
+│   ├── Dockerfile               # Hardened python:3.11.11-slim-bookworm, non-root appuser, Gunicorn entrypoint
+│   ├── main.py                  # Authenticated stage webhook (research, plan, write, optimize) + Drive fetcher
+│   ├── requirements.txt         # Pinned runtime and test dependencies
+│   └── tests/
+│       └── test_main.py         # Unit test suite covering auth, Drive allowlist, XML/scratchpad, and stages
+└── prompts/
+    ├── agent_a_researcher.md    # Sanitized Agent A (Research Analyst) prompt template
+    ├── agent_b_planner.md       # Sanitized Agent B (Editorial Architect) prompt template
+    ├── agent_c_writer.md        # Sanitized Agent C (B2B SaaS Writer) prompt template
+    └── agent_d_optimizer.md     # Sanitized Agent D (SEO/GEO Optimizer) prompt template
+```
 
-**A. Google Workspace (Storage & UI)**
-1.  Create a target folder in Google Drive and copy the Folder ID from the URL.
-2.  Create a Google Sheet with the following columns: `Topic`, `Core Focus`, `Description`, `Output Doc Link`, `Human Edits`, `Reviewed Doc Link`, `Human Review`.
-3.  Open *Extensions > Apps Script*, paste your `Code.gs` middleware, and update the `DESTINATION_FOLDER_ID` constant.
+---
 
-**B. Google Cloud (Backend Compute)**
-1.  Create a new project in Google Cloud Console.
-2.  Enable the Cloud Run and Cloud Build APIs.
-3.  Deploy the Python backend (`main.py` and `requirements.txt`) to Cloud Run via GitHub integration (using Buildpacks) or a custom Dockerfile.
-4.  Add your Gemini API Key as an environment variable (`GOOGLE_API_KEY_ARTICLE`).
-5.  Set the service to "Allow unauthenticated invocations" and copy the service URL.
+## 4. Google Sheets Schema
 
-**C. Connecting the Loop**
-1.  In your Google Apps Script (`Code.gs`), paste the Cloud Run URL into the `CLOUD_FUNCTION_URL` constant.
-2.  *(Note: The prompt templates are stored externally in Google Docs for easy editing by content teams. The IDs for these documents must also be configured in `Code.gs`.)*
+### A. Content Tracker Tab (`Article Backlog` / `Arical backlog`)
+
+| Column | Header | Purpose |
+| :--- | :--- | :--- |
+| **A** | `Topic` | Primary subject of the article (required). |
+| **B** | `Core Focus` | Specific thesis, angle, or case study focus. |
+| **C** | `Description` | Audience, series context, and editorial notes. |
+| **D** | `Output Doc Link` | Generated `v1 (Draft)` Google Doc URL (prior URLs archived in cell Note). |
+| **E** | `Human Edits` | Editorial gate dropdown: `Pending Review`, `In Revision`, `Approved`. |
+| **F** | `Reviewed Doc Link` | Generated `v2 (Final)` Google Doc URL (prior URLs archived in cell Note). |
+| **G** | `Human Review` | Set automatically to `Ready for CMS` after Phase 2 completes. |
+| **H** | `Pipeline Status` | Non-destructive live stage progress (`⏳`, `✅`, `⏸️`, `❌`). |
+| **I** | `Experiment ID` | Optional per-row `Experiment_ID` override; otherwise records the active config used. |
+| **J** | `Checkpoint State` | Tracks Stage 1/2 checkpoint persistence and cleanup. |
+| **K** | `Last Run Metrics` | Timestamp, per-stage duration, and Gemini token counts. |
+| **L** | `Last Error` | Timestamped error details if a stage fails (never overwrites Doc links). |
+
+### B. `Experiment_Config` Tab (Protected)
+Use **🚀 AI Content Engine -> 🧪 Initialize Experiment_Config Tab** to generate this sheet automatically:
+
+| Column | Header | Description |
+| :--- | :--- | :--- |
+| **A** | `Experiment_ID` | Unique identifier (e.g., `exp_v2_default`). |
+| **B** | `Active` | Set `TRUE` on the default configuration row. |
+| **C** | `Researcher_Doc_ID` | Google Doc ID for Agent A inside `ALLOWED_PROMPT_FOLDER_ID`. |
+| **D** | `Planner_Doc_ID` | Google Doc ID for Agent B inside `ALLOWED_PROMPT_FOLDER_ID`. |
+| **E** | `Writer_Doc_ID` | Google Doc ID for Agent C inside `ALLOWED_PROMPT_FOLDER_ID`. |
+| **F** | `Optimizer_Doc_ID` | Google Doc ID for Agent D inside `ALLOWED_PROMPT_FOLDER_ID`. |
+| **G** | `Draft_Folder_ID` | Target Google Drive folder ID for `v1` drafts and temporary stage checkpoints. |
+| **H** | `Final_Folder_ID` | Target Google Drive folder ID for `v2` final articles (defaults to `Draft_Folder_ID` if blank). |
+| **I** | `Notes` | Optional notes describing prompt versions or experiments. |
+
+---
+
+## 5. Step-by-Step Setup & Replication Guide
+
+### Step 1: Prepare Google Drive Folders & Prompt Docs
+1. Create two folders in Google Drive:
+   * **Prompt Folder:** Copy its folder ID from the URL — this will be your `ALLOWED_PROMPT_FOLDER_ID`.
+   * **Output Folder:** Copy its folder ID for `Draft_Folder_ID` / `Final_Folder_ID`.
+2. Upload the four Markdown templates in [`prompts/`](./prompts) (`agent_a_researcher.md` through `agent_d_optimizer.md`) into your **Prompt Folder** as native **Google Docs** (*File -> Save as Google Docs* if uploaded as Markdown/text) and note each Doc ID.
+
+### Step 2: Provision GCP APIs, Runtime Service Account & Secret Manager
+1. Enable the required Google Cloud APIs in your GCP project:
+   ```bash
+   gcloud services enable \
+     run.googleapis.com \
+     cloudbuild.googleapis.com \
+     artifactregistry.googleapis.com \
+     secretmanager.googleapis.com \
+     drive.googleapis.com \
+     --project="YOUR_GCP_PROJECT_ID"
+   ```
+2. Create a dedicated least-privilege runtime Service Account for Cloud Run:
+   ```bash
+   gcloud iam service-accounts create content-engine-runtime \
+     --display-name="HITL Content Engine Cloud Run Runtime" \
+     --project="YOUR_GCP_PROJECT_ID"
+
+   gcloud projects add-iam-policy-binding "YOUR_GCP_PROJECT_ID" \
+     --member="serviceAccount:content-engine-runtime@YOUR_GCP_PROJECT_ID.iam.gserviceaccount.com" \
+     --role="roles/logging.logWriter"
+   ```
+3. Generate a 32-byte webhook secret (`openssl rand -hex 32`) and store both `GOOGLE_API_KEY_ARTICLE` (from Google AI Studio) and `WEBHOOK_SHARED_SECRET` in **Secret Manager**, granting `roles/secretmanager.secretAccessor` **only** on those two secrets to `content-engine-runtime@YOUR_GCP_PROJECT_ID.iam.gserviceaccount.com`.
+
+### Step 3: Share the Drive Prompt Folder with the Runtime Service Account (Mandatory)
+> **CRITICAL REPLICATION STEP — Drive Service Account Sharing:**
+> Because Cloud Run fetches and verifies Agent A–D prompt Docs server-side using the Google Drive API (`drive.googleapis.com`), you **must**:
+> 1. Confirm `drive.googleapis.com` is enabled in your GCP project (Step 2.1 above).
+> 2. In Google Drive, right-click your **Prompt Folder** (`ALLOWED_PROMPT_FOLDER_ID`) -> **Share**, and add your Cloud Run runtime Service Account email (`content-engine-runtime@YOUR_GCP_PROJECT_ID.iam.gserviceaccount.com`) with **Viewer** permission.
+>
+> *(Cloud Run only needs **Viewer** access to the Prompt Folder; Google Docs creation in the Output Folder is executed by Apps Script under the human editor's Drive permissions.)*
+
+### Step 4: Run Tests & Deploy Cloud Run
+1. Run the local unit test suite before deploying:
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install -r backend/requirements.txt
+   .venv/bin/pytest -v backend/tests/test_main.py
+   ```
+2. Deploy to Cloud Run using the hardened [`backend/Dockerfile`](./backend/Dockerfile) (or [`cloudbuild.yaml`](./cloudbuild.yaml), which enforces `pytest` before building the image):
+   ```bash
+   gcloud run deploy hitl-content-webhook \
+     --source=backend \
+     --region="europe-west1" \
+     --service-account="content-engine-runtime@YOUR_GCP_PROJECT_ID.iam.gserviceaccount.com" \
+     --set-env-vars="ALLOWED_PROMPT_FOLDER_ID=YOUR_PROMPT_FOLDER_ID" \
+     --set-secrets="GOOGLE_API_KEY_ARTICLE=gemini-api-key:latest,WEBHOOK_SHARED_SECRET=webhook-shared-secret:latest" \
+     --concurrency=4 \
+     --max-instances=3 \
+     --memory=2Gi \
+     --cpu=1 \
+     --timeout=300 \
+     --allow-unauthenticated
+   ```
+   *(Note: If deploying via Cloud Run Buildpacks instead of `backend/Dockerfile`, also set `GOOGLE_FUNCTION_TARGET=generate_blog_post`.)*
+
+### Step 5: Configure Google Sheets & Bound Apps Script
+1. Create your Master Content Tracker Google Sheet with Columns A–G (add a Data Validation dropdown on Column E with `Pending Review`, `In Revision`, `Approved`).
+2. Open **Extensions -> Apps Script**:
+   * In **Project Settings**, check **Show "appsscript.json" manifest file in editor**.
+   * Paste [`apps_script/appsscript.json`](./apps_script/appsscript.json) (which enables the **Drive API v3** Advanced Service) and [`apps_script/Code.gs`](./apps_script/Code.gs), then save.
+3. Reload the Google Sheet and use the **🚀 AI Content Engine** menu:
+   * Click **🧪 Initialize Experiment_Config Tab** and paste your Agent A–D Google Doc IDs and target Drive Folder IDs.
+   * Click **⚙️ Configure Settings** to store your `CLOUD_RUN_URL` and `WEBHOOK_SHARED_SECRET` in `PropertiesService`.
